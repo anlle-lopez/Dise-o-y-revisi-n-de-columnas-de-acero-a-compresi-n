@@ -22,6 +22,20 @@ AUTORA = "Anllelina Lopez Romero"
 
 st.set_page_config(page_title="Columnas de acero a compresión", page_icon="🏗️", layout="wide")
 
+# Oculta los accesos de la barra superior (Share, estrella, editar y GitHub)
+st.markdown(
+    """
+    <style>
+    [data-testid="stToolbarActions"],
+    [data-testid="stToolbar"] a[href*="github.com"],
+    .stAppDeployButton,
+    .viewerBadge_container__r5tak,
+    ._profileContainer_gzau3_53 {display: none !important;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 PI = math.pi
 PHI_C = 0.90  # [adimensional] factor de resistencia a compresión
 
@@ -781,7 +795,9 @@ def verificar(p, E, G, Fy, Kx, Ky, Kz, Lx, Ly, Lz):
 # ----------------------------------------------------------------------------
 COL_TIPO = "Tipo"
 COL_PERFIL = "Perfil"
-COL_I = "I [mm⁴]"
+COL_IX = "Ix perfil [mm⁴]"
+COL_IY = "Iy perfil [mm⁴]"
+COL_I = "I usada [mm⁴]"
 COL_L = "L [mm]"
 COL_N = "Cantidad [ud]"
 COL_E = "Extremo lejano"
@@ -793,6 +809,40 @@ def inercia_de_perfil(nombre):
     """Ix [mm⁴] del perfil IR del catálogo (eje fuerte, flexión en el plano del pórtico) o None."""
     f = FILA.get(nombre)
     return None if f is None else f[17] * 1e4
+
+
+def inercia_y_de_perfil(nombre):
+    """Iy [mm⁴] del perfil IR del catálogo (eje débil) o None."""
+    f = FILA.get(nombre)
+    return None if f is None else f[20] * 1e4
+
+
+def sincronizar_inercias(df):
+    """Rellena Ix e Iy según el perfil elegido; I usada = Ix del perfil.
+    Sin perfil («— (I manual)») se vacían Ix/Iy y se respeta la I escrita a mano."""
+    df = df.copy()
+    ix, iy, iu = [], [], []
+    for _, r in df.iterrows():
+        nom = r.get(COL_PERFIL)
+        a, b = inercia_de_perfil(nom), inercia_y_de_perfil(nom)
+        ix.append(np.nan if a is None else a)
+        iy.append(np.nan if b is None else b)
+        iu.append(a if a is not None else pd.to_numeric(r.get(COL_I), errors="coerce"))
+    df[COL_IX] = pd.to_numeric(pd.Series(ix, index=df.index), errors="coerce")
+    df[COL_IY] = pd.to_numeric(pd.Series(iy, index=df.index), errors="coerce")
+    df[COL_I] = pd.to_numeric(pd.Series(iu, index=df.index), errors="coerce")
+    return df
+
+
+def _inercias_iguales(a, b):
+    if len(a) != len(b):
+        return False
+    for c in (COL_IX, COL_IY, COL_I):
+        va = pd.to_numeric(a[c], errors="coerce").to_numpy(dtype=float)
+        vb = pd.to_numeric(b[c], errors="coerce").to_numpy(dtype=float)
+        if not np.allclose(va, vb, equal_nan=True):
+            return False
+    return True
 
 
 EXTREMOS = {
@@ -810,8 +860,7 @@ def psi_rigideces(df, E, I_col, L_col):
     sb = 0.0
     for _, r in df.iterrows():
         try:
-            I_perfil = inercia_de_perfil(r.get(COL_PERFIL))
-            I = I_perfil if I_perfil is not None else float(r[COL_I])
+            I = float(r[COL_I])
             L = float(r[COL_L])
             q = float(r[COL_N])
         except (TypeError, ValueError):
@@ -846,26 +895,37 @@ def bloque_nodo_libre(nombre, clave, df_defecto, E, L_col, p):
         st.stop()
     st.caption("Elementos concurrentes al nodo (además de la columna analizada). Las vigas usan su "
                "inercia en el plano considerado; 'Extremo lejano' aplica los ajustes de la hoja NSR-10.")
-    df = st.data_editor(
-        df_defecto, num_rows="dynamic", key="df_" + clave, hide_index=True,
-        column_order=[COL_TIPO, COL_PERFIL, COL_I, COL_L, COL_N, COL_E],
+    k_base, k_ver = "base_" + clave, "ver_" + clave
+    if k_base not in st.session_state:
+        st.session_state[k_base] = sincronizar_inercias(df_defecto)
+        st.session_state[k_ver] = 0
+    df_ed = st.data_editor(
+        st.session_state[k_base], num_rows="dynamic", key="df_" + clave + "_" + str(st.session_state[k_ver]),
+        hide_index=True, disabled=[COL_IX, COL_IY],
+        column_order=[COL_TIPO, COL_PERFIL, COL_IX, COL_IY, COL_I, COL_L, COL_N, COL_E],
         column_config={
             COL_TIPO: st.column_config.SelectboxColumn(COL_TIPO, options=["Viga", "Columna"], required=True),
             COL_PERFIL: st.column_config.SelectboxColumn(
                 COL_PERFIL, options=OPCIONES_PERFIL, required=True,
-                help="Perfil IR del catálogo. Si se elige uno, se usa su Ix y se ignora la columna I."),
-            COL_I: st.column_config.NumberColumn(COL_I, format="%.0f", min_value=0.0),
+                help="Perfil IR del catálogo. Al elegirlo se llenan Ix, Iy e «I usada» (= Ix)."),
+            COL_IX: st.column_config.NumberColumn(COL_IX, format="%.0f"),
+            COL_IY: st.column_config.NumberColumn(COL_IY, format="%.0f"),
+            COL_I: st.column_config.NumberColumn(
+                COL_I, format="%.0f", min_value=0.0,
+                help="Con perfil: toma Ix (eje fuerte). Con «— (I manual)»: se usa el valor que escriba."),
             COL_L: st.column_config.NumberColumn(COL_L, format="%.0f", min_value=0.0),
             COL_N: st.column_config.NumberColumn(COL_N, format="%.0f", min_value=0.0),
             COL_E: st.column_config.SelectboxColumn(COL_E, options=list(EXTREMOS.keys()), required=True),
         },
     )
-    con_perfil = df[df[COL_PERFIL].apply(lambda v: inercia_de_perfil(v) is not None)]
-    if len(con_perfil) > 0:
-        st.caption("Con perfil seleccionado se usa su Ix (eje fuerte) en lugar de la columna I: "
-                   + "; ".join(str(r[COL_TIPO]) + " " + str(r[COL_PERFIL]).split("  (")[0] + " → I = "
-                               + n(inercia_de_perfil(r[COL_PERFIL]), 0) + " mm⁴"
-                               for _, r in con_perfil.iterrows()) + ".")
+    df = sincronizar_inercias(df_ed)
+    if not _inercias_iguales(df, df_ed):
+        # El perfil cambió: se guardan las inercias nuevas y se recarga el editor con ellas
+        st.session_state[k_base] = df.reset_index(drop=True)
+        st.session_state[k_ver] += 1
+        st.rerun()
+    st.caption("Con perfil seleccionado, «I usada» = Ix (eje fuerte, flexión en el plano del pórtico). "
+               "Con «— (I manual)» se usa la I que usted escriba.")
     res = []
     for eje, I_col in (("x", p["Ix"]), ("y", p["Iy"])):
         psi, sc, sb = psi_rigideces(df, E, I_col, L_col)
@@ -914,11 +974,7 @@ with col_mat:
 with col_perf:
     st.subheader("Perfil – Manual Gerdau Corsa 2019")
     fam = st.selectbox("Tipo de perfil", list(FAM_NOMBRES.keys()), index=0, format_func=lambda k: FAM_NOMBRES[k])
-    if fam in ("IR", "CE"):
-        hw_apuntes = st.checkbox("Usar hw = d − 2·tf (como en los apuntes). Desmarcar para usar T = d − 2k del manual.",
-                                 value=True)
-    else:
-        hw_apuntes = True
+    hw_apuntes = True  # hw = d − 2·tf (como en los apuntes)
     CAT_TODO = catalogo_total(hw_apuntes)
     CATALOGO = CAT_TODO[fam]
     opciones_perfil = list(CATALOGO.keys()) + (["Personalizado"] if fam == "IR" else [])
@@ -1022,9 +1078,9 @@ else:
     st.caption("Se usan los ajustes de la hoja NSR-10: apoyo articulado → G = 10; apoyo empotrado → G = 1. "
                "Un nodo «libre» es un nodo rígido con vigas, cuyo G se calcula por rigideces o se ingresa a mano.")
 
-    df_A = pd.DataFrame({COL_TIPO: ["Viga", "Viga"], COL_PERFIL: [SIN_PERFIL, SIN_PERFIL], COL_I: [82_330_100.0, 42_371_800.0],
+    df_A = pd.DataFrame({COL_TIPO: ["Viga", "Viga"], COL_PERFIL: [SIN_PERFIL, SIN_PERFIL], COL_IX: [np.nan, np.nan], COL_IY: [np.nan, np.nan], COL_I: [82_330_100.0, 42_371_800.0],
                          COL_L: [6000.0, 5000.0], COL_N: [2.0, 2.0], COL_E: ["Rígido (×1)", "Rígido (×1)"]})
-    df_B = pd.DataFrame({COL_TIPO: ["Viga", "Viga"], COL_PERFIL: [SIN_PERFIL, SIN_PERFIL], COL_I: [82_330_100.0, 42_371_800.0],
+    df_B = pd.DataFrame({COL_TIPO: ["Viga", "Viga"], COL_PERFIL: [SIN_PERFIL, SIN_PERFIL], COL_IX: [np.nan, np.nan], COL_IY: [np.nan, np.nan], COL_I: [82_330_100.0, 42_371_800.0],
                          COL_L: [6000.0, 5000.0], COL_N: [2.0, 2.0], COL_E: ["Rígido (×1)", "Rígido (×1)"]})
     cA, cB = st.columns(2)
     with cA:
