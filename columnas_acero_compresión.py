@@ -793,92 +793,48 @@ def verificar(p, E, G, Fy, Kx, Ky, Kz, Lx, Ly, Lz):
 # ----------------------------------------------------------------------------
 # Nodos para cálculo de G (ψ)
 # ----------------------------------------------------------------------------
-COL_TIPO = "Tipo"
-COL_PERFIL = "Perfil"
-COL_IX = "Ix perfil [mm⁴]"
-COL_IY = "Iy perfil [mm⁴]"
-COL_I = "I usada [mm⁴]"
-COL_L = "L [mm]"
-COL_N = "Cantidad [ud]"
-COL_E = "Extremo lejano"
-SIN_PERFIL = "— (I manual)"
-OPCIONES_PERFIL = [SIN_PERFIL] + list(NOMBRES)
-
-
-def inercia_de_perfil(nombre):
-    """Ix [mm⁴] del perfil IR del catálogo (eje fuerte, flexión en el plano del pórtico) o None."""
-    f = FILA.get(nombre)
-    return None if f is None else f[17] * 1e4
-
-
-def inercia_y_de_perfil(nombre):
-    """Iy [mm⁴] del perfil IR del catálogo (eje débil) o None."""
-    f = FILA.get(nombre)
-    return None if f is None else f[20] * 1e4
-
-
-def sincronizar_inercias(df):
-    """Rellena Ix e Iy según el perfil elegido; I usada = Ix del perfil.
-    Sin perfil («— (I manual)») se vacían Ix/Iy y se respeta la I escrita a mano."""
-    df = df.copy()
-    ix, iy, iu = [], [], []
-    for _, r in df.iterrows():
-        nom = r.get(COL_PERFIL)
-        a, b = inercia_de_perfil(nom), inercia_y_de_perfil(nom)
-        ix.append(np.nan if a is None else a)
-        iy.append(np.nan if b is None else b)
-        iu.append(a if a is not None else pd.to_numeric(r.get(COL_I), errors="coerce"))
-    df[COL_IX] = pd.to_numeric(pd.Series(ix, index=df.index), errors="coerce")
-    df[COL_IY] = pd.to_numeric(pd.Series(iy, index=df.index), errors="coerce")
-    df[COL_I] = pd.to_numeric(pd.Series(iu, index=df.index), errors="coerce")
-    return df
-
-
-def _inercias_iguales(a, b):
-    if len(a) != len(b):
-        return False
-    for c in (COL_IX, COL_IY, COL_I):
-        va = pd.to_numeric(a[c], errors="coerce").to_numpy(dtype=float)
-        vb = pd.to_numeric(b[c], errors="coerce").to_numpy(dtype=float)
-        if not np.allclose(va, vb, equal_nan=True):
-            return False
-    return True
-
-
 EXTREMOS = {
     "Rígido (×1)": 1.0,
     "Giro nulo / empotrado (×2/3)": 2.0 / 3.0,
     "Articulado (×1/2)": 0.5,
-    "Articulada a la columna (no cuenta)": 0.0,
 }
+PERFIL_MANUAL = "— (I manual)"
+OPCIONES_NODO = list(NOMBRES) + [PERFIL_MANUAL]
 
 
-def psi_rigideces(df, E, I_col, L_col):
-    """G = sum(E*Ic/Lc) / sum(E*Ib/Lb). Devuelve (G, sum_c, sum_b) en N*mm.
-    Las vigas se afectan por el factor de la hoja NSR-10 según su extremo lejano."""
-    sc = E * I_col / L_col
-    sb = 0.0
-    for _, r in df.iterrows():
-        try:
-            I = float(r[COL_I])
-            L = float(r[COL_L])
-            q = float(r[COL_N])
-        except (TypeError, ValueError):
-            continue
-        if any(math.isnan(v) for v in (I, L, q)) or L <= 0:
-            continue
-        rig = q * E * I / L
-        if r[COL_TIPO] == "Columna":
-            sc += rig
-        else:
-            sb += rig * EXTREMOS.get(r.get(COL_E), 1.0)
-    if sb <= 0:
-        return None, sc, sb
-    return sc / sb, sc, sb
+def _idx_perfil(fragmento):
+    """Índice (en OPCIONES_NODO) del primer perfil IR cuyo nombre contiene el fragmento."""
+    return next((i for i, nm in enumerate(NOMBRES) if fragmento in nm), 0)
 
 
-def bloque_nodo_libre(nombre, clave, df_defecto, E, L_col, p):
-    """Nodo 'libre' (rígido con vigas): devuelve (G_x, G_y)."""
+def rigidez(E, I, L):
+    """E·I/L en N·mm. Devuelve 0.0 si I o L no son válidos (evita división por cero)."""
+    if I is None or L is None or L <= 0 or I <= 0:
+        return 0.0
+    return E * I / L
+
+
+def campos_elemento(etiqueta, clave, idx_def, L_def, con_extremo):
+    """Campos de un elemento (columna o viga) que llega al nodo. Devuelve dict(Ix, Iy, L, f)."""
+    c1, c2, c3 = st.columns([3, 2, 3] if con_extremo else [3, 2, 1])
+    perfil = c1.selectbox(etiqueta + " – perfil", OPCIONES_NODO, index=idx_def, key="perf_" + clave)
+    L = c2.number_input(etiqueta + " – L [mm]", 0.0, 1.0e6, L_def, 50.0, format="%.0f", key="L_" + clave)
+    f = 1.0
+    if con_extremo:
+        ext = c3.selectbox(etiqueta + " – extremo lejano", list(EXTREMOS.keys()), key="ext_" + clave)
+        f = EXTREMOS[ext]
+    if perfil == PERFIL_MANUAL:
+        I = st.number_input(etiqueta + " – I [mm⁴]", 0.0, 1.0e11, 0.0, 1.0e5, format="%.0f", key="I_" + clave)
+        return dict(Ix=I, Iy=I, L=L, f=f)
+    fila = FILA[perfil]
+    Ix, Iy = fila[17] * 1e4, fila[20] * 1e4  # cm⁴ → mm⁴
+    c1.caption("Ix = " + n(Ix, 0) + " mm⁴ · Iy = " + n(Iy, 0) + " mm⁴")
+    return dict(Ix=Ix, Iy=Iy, L=L, f=f)
+
+
+def bloque_nodo_libre(nombre, clave, E, L_col, p):
+    """Nodo 'libre' (rígido con vigas): devuelve (G_x, G_y).
+    G = Σ(E·I_col/L_col) / Σ(E·I_viga/L_viga)"""
     st.markdown("**Nodo " + nombre + " – libre**")
     opciones = ["Calcular por rigideces", "Valor manual"]
     cond = st.selectbox("G del nodo " + nombre, opciones, index=0, key="cond_" + clave)
@@ -893,50 +849,43 @@ def bloque_nodo_libre(nombre, clave, df_defecto, E, L_col, p):
         st.error("Para calcular G por rigideces se necesita L (longitud de la columna). "
                  "Ingrese L o use 'Valor manual'.")
         st.stop()
-    st.caption("Elementos concurrentes al nodo (además de la columna analizada). Las vigas usan su "
-               "inercia en el plano considerado; 'Extremo lejano' aplica los ajustes de la hoja NSR-10.")
-    k_base, k_ver = "base_" + clave, "ver_" + clave
-    if k_base not in st.session_state:
-        st.session_state[k_base] = sincronizar_inercias(df_defecto)
-        st.session_state[k_ver] = 0
-    df_ed = st.data_editor(
-        st.session_state[k_base], num_rows="dynamic", key="df_" + clave + "_" + str(st.session_state[k_ver]),
-        hide_index=True, disabled=[COL_IX, COL_IY],
-        column_order=[COL_TIPO, COL_PERFIL, COL_IX, COL_IY, COL_I, COL_L, COL_N, COL_E],
-        column_config={
-            COL_TIPO: st.column_config.SelectboxColumn(COL_TIPO, options=["Viga", "Columna"], required=True),
-            COL_PERFIL: st.column_config.SelectboxColumn(
-                COL_PERFIL, options=OPCIONES_PERFIL, required=True,
-                help="Perfil IR del catálogo. Al elegirlo se llenan Ix, Iy e «I usada» (= Ix)."),
-            COL_IX: st.column_config.NumberColumn(COL_IX, format="%.0f"),
-            COL_IY: st.column_config.NumberColumn(COL_IY, format="%.0f"),
-            COL_I: st.column_config.NumberColumn(
-                COL_I, format="%.0f", min_value=0.0,
-                help="Con perfil: toma Ix (eje fuerte). Con «— (I manual)»: se usa el valor que escriba."),
-            COL_L: st.column_config.NumberColumn(COL_L, format="%.0f", min_value=0.0),
-            COL_N: st.column_config.NumberColumn(COL_N, format="%.0f", min_value=0.0),
-            COL_E: st.column_config.SelectboxColumn(COL_E, options=list(EXTREMOS.keys()), required=True),
-        },
-    )
-    df = sincronizar_inercias(df_ed)
-    if not _inercias_iguales(df, df_ed):
-        # El perfil cambió: se guardan las inercias nuevas y se recarga el editor con ellas
-        st.session_state[k_base] = df.reset_index(drop=True)
-        st.session_state[k_ver] += 1
-        st.rerun()
-    st.caption("Con perfil seleccionado, «I usada» = Ix (eje fuerte, flexión en el plano del pórtico). "
-               "Con «— (I manual)» se usa la I que usted escriba.")
+
+    st.caption("La columna analizada ya está incluida en el numerador. Indique cuántas columnas adicionales "
+               "y cuántas vigas llegan al nodo; las vigas usan su Ix y «Extremo lejano» aplica los ajustes "
+               "de la hoja NSR-10.")
+    cn, cv = st.columns(2)
+    n_col = int(cn.number_input("Columnas adicionales que llegan al nodo [ud]", 0, 20, 0, 1, key="ncol_" + clave))
+    n_vig = int(cv.number_input("Vigas que llegan al nodo [ud]", 0, 20, 2, 1, key="nvig_" + clave))
+
+    columnas, vigas = [], []
+    for i in range(n_col):
+        columnas.append(campos_elemento("Columna " + str(i + 1), clave + "_c" + str(i),
+                                        _idx_perfil("305 x 74.4"), 6000.0, False))
+    for i in range(n_vig):
+        vigas.append(campos_elemento("Viga " + str(i + 1), clave + "_v" + str(i),
+                                     _idx_perfil("356 x 32.9"), 6000.0 if i % 2 == 0 else 5000.0, True))
+
     res = []
-    for eje, I_col in (("x", p["Ix"]), ("y", p["Iy"])):
-        psi, sc, sb = psi_rigideces(df, E, I_col, L_col)
-        if psi is None:
-            st.warning("Nodo " + nombre + " eje " + eje + ": no hay vigas; se adopta G = 10 (articulado).")
+    for eje, kI, I_col in (("x", "Ix", p["Ix"]), ("y", "Iy", p["Iy"])):
+        sc = rigidez(E, I_col, L_col)                       # numerador: columna analizada + adicionales
+        for c in columnas:
+            sc += rigidez(E, c[kI], c["L"])
+        sb = 0.0                                            # denominador: vigas (todas con Ix)
+        for v in vigas:
+            sb += rigidez(E, v["Ix"], v["L"]) * v["f"]
+        if sb <= 0:
+            st.warning("Nodo " + nombre + " eje " + eje + ": la sumatoria de rigideces de las vigas es 0 "
+                       "(sin vigas, o falta perfil / L). No se puede dividir; se adopta G = 10 (articulado).")
             psi = 10.0
         else:
+            psi = sc / sb
             st.latex(r"G_{" + eje + nombre[0] + r"}=\frac{\sum E I_c/L_c}{\sum E I_b/L_b}=\frac{"
                      + sci(sc) + r"\,\text{N·mm}}{" + sci(sb) + r"\,\text{N·mm}}="
                      + n(psi) + U_ADIM)
         res.append(psi)
+    m1, m2 = st.columns(2)
+    m1.metric("G" + "x" + nombre[0] + " [adim.]", n(res[0]))
+    m2.metric("G" + "y" + nombre[0] + " [adim.]", n(res[1]))
     return res[0], res[1]
 
 
@@ -1078,10 +1027,6 @@ else:
     st.caption("Se usan los ajustes de la hoja NSR-10: apoyo articulado → G = 10; apoyo empotrado → G = 1. "
                "Un nodo «libre» es un nodo rígido con vigas, cuyo G se calcula por rigideces o se ingresa a mano.")
 
-    df_A = pd.DataFrame({COL_TIPO: ["Viga", "Viga"], COL_PERFIL: [SIN_PERFIL, SIN_PERFIL], COL_IX: [np.nan, np.nan], COL_IY: [np.nan, np.nan], COL_I: [82_330_100.0, 42_371_800.0],
-                         COL_L: [6000.0, 5000.0], COL_N: [2.0, 2.0], COL_E: ["Rígido (×1)", "Rígido (×1)"]})
-    df_B = pd.DataFrame({COL_TIPO: ["Viga", "Viga"], COL_PERFIL: [SIN_PERFIL, SIN_PERFIL], COL_IX: [np.nan, np.nan], COL_IY: [np.nan, np.nan], COL_I: [82_330_100.0, 42_371_800.0],
-                         COL_L: [6000.0, 5000.0], COL_N: [2.0, 2.0], COL_E: ["Rígido (×1)", "Rígido (×1)"]})
     cA, cB = st.columns(2)
     with cA:
         if caso.startswith("Caso 1"):
@@ -1091,10 +1036,10 @@ else:
             st.markdown("**Nodo A (base) – empotrado**")
             GAx = GAy = 1.0
         else:
-            GAx, GAy = bloque_nodo_libre("A (base)", "A", df_A, E, Lcol, P)
+            GAx, GAy = bloque_nodo_libre("A (base)", "A", E, Lcol, P)
         st.latex(r"G_A=" + n(GAx))
     with cB:
-        GBx, GBy = bloque_nodo_libre("B (cabeza)", "B", df_B, E, Lcol, P)
+        GBx, GBy = bloque_nodo_libre("B (cabeza)", "B", E, Lcol, P)
 
     # ---- NSR-10 (nomograma) y Eurocódigo
     Kx_n, Ky_n = k_nsr10(GAx, GBx), k_nsr10(GAy, GBy)
